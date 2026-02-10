@@ -23,7 +23,8 @@ AUTH_URL = "https://api.kroger.com/v1/connect/oauth2"
 TOKEN_DIR = os.path.expanduser("~/.local/share/kroger-mcp")
 TOKEN_FILE = os.path.join(TOKEN_DIR, "tokens.json")
 
-SCOPES = "product.compact cart.basic:write"
+APP_SCOPES = "product.compact"
+USER_SCOPES = "product.compact cart.basic:write"
 
 
 class AuthManager:
@@ -87,7 +88,7 @@ class AuthManager:
             headers=self._basic_auth_header(),
             data={
                 "grant_type": "client_credentials",
-                "scope": SCOPES,
+                "scope": APP_SCOPES,
             },
         )
         resp.raise_for_status()
@@ -108,7 +109,7 @@ class AuthManager:
         """Build the Kroger OAuth authorization URL."""
         return (
             f"{AUTH_URL}/authorize"
-            f"?scope={SCOPES.replace(' ', '%20')}"
+            f"?scope={USER_SCOPES.replace(' ', '%20')}"
             f"&response_type=code"
             f"&client_id={self.client_id}"
             f"&redirect_uri={self.redirect_uri}"
