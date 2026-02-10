@@ -1,81 +1,233 @@
-from mcp import Server, stdio_server
-# Assuming the mcp library is installed and provides these.
-# If the library structure is different (e.g., mcp.server.Server), imports might need adjustment.
+"""Kroger MCP Server — product search, store lookup, and cart management."""
 
-# Import the tools individually
-from tools import find_stores, search_products, get_product, add_to_cart
-# Import config to access KROGER_CLIENT_ID/SECRET for a check.
-from config import KROGER_CLIENT_ID, KROGER_CLIENT_SECRET
+import sys
 
-# Note: The tools.py file initializes a global 'auth_manager'.
-# If 'auth_manager' needed to be explicitly passed or if tools didn't rely on a global one,
-# we might need to import it here and pass it during tool registration or server initialization.
-# from tools import auth_manager # Example if it were needed
+import requests
+from mcp.server.fastmcp import FastMCP
 
-def run_server():
-    # Check if essential configuration is present
-    if not KROGER_CLIENT_ID or KROGER_CLIENT_ID == "YOUR_CLIENT_ID_HERE" or \
-       not KROGER_CLIENT_SECRET or KROGER_CLIENT_SECRET == "YOUR_CLIENT_SECRET_HERE":
-        print("ERROR: Kroger Client ID or Secret is not configured in config.py.")
-        print("Please set KROGER_CLIENT_ID and KROGER_CLIENT_SECRET before running the server.")
-        # In a real scenario, you might exit with a non-zero code:
-        # import sys
-        # sys.exit(1)
-        return # Do not start the server if not configured
+from auth import AuthManager, BASE_URL
 
-    print("Initializing Kroger MCP Server...")
-    # Name and version for the server as per MCP guidelines
-    kroger_mcp_server = Server(name="kroger-mcp-server", version="1.0.0")
+mcp = FastMCP("kroger")
+auth = AuthManager()
 
-    # Register the tools
-    # Assuming an add_tool method on the Server instance as per the plan.
-    # The @tool decorator in tools.py should have attached necessary metadata (name, description)
-    # to the tool functions themselves, which add_tool will use.
-    
-    print("Registering tools...")
-    kroger_mcp_server.add_tool(find_stores)
-    kroger_mcp_server.add_tool(search_products)
-    kroger_mcp_server.add_tool(get_product)
-    kroger_mcp_server.add_tool(add_to_cart)
-    # If more tools like view_cart, get_profile were implemented, they'd be added here.
 
-    print("Kroger MCP Server initialized with the following tools:")
-    # Assuming server.tools lists registered tool names or objects with a 'name' attribute
-    # This part depends on the actual implementation of mcp.Server
-    if hasattr(kroger_mcp_server, 'tools') and isinstance(kroger_mcp_server.tools, dict):
-        for tool_name in kroger_mcp_server.tools.keys(): # If tools is a dict name:function
-            print(f"- {tool_name}")
-    elif hasattr(kroger_mcp_server, 'get_tool_names'): # Or if there's a method
-         for tool_name in kroger_mcp_server.get_tool_names():
-            print(f"- {tool_name}")
-    else:
-        # Fallback if we don't know how to list tools, list from what we tried to add
-        print("- find_stores (assumed registered)")
-        print("- search_products (assumed registered)")
-        print("- get_product (assumed registered)")
-        print("- add_to_cart (assumed registered)")
-    
-    print("\nStarting MCP server with STDIO transport...")
-    print("Server is now listening for JSON-RPC requests on stdin/stdout.")
-    print("Ensure MCP client (e.g., Claude Desktop) is configured to launch this script.")
-    print("Press Ctrl+C to stop the server.")
+def _app_headers():
+    """Headers for app-level API calls (product/store search)."""
+    return {
+        "Authorization": f"Bearer {auth.get_app_token()}",
+        "Accept": "application/json",
+    }
 
-    # Start the server using STDIO transport
+
+def _user_headers():
+    """Headers for user-level API calls (cart). Raises if not authorized."""
+    token = auth.get_user_token()
+    if not token:
+        auth_url = auth.generate_authorize_url()
+        raise RuntimeError(
+            f"Not authorized. Please authorize first.\n\n"
+            f"Option 1: Run `python auth.py` with your credentials to authorize interactively.\n\n"
+            f"Option 2: Visit this URL, then give me the code from the redirect:\n{auth_url}"
+        )
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+
+@mcp.tool()
+def find_stores(zip_code: str, radius_miles: int = 10, limit: int = 5) -> str:
+    """Find Kroger stores near a ZIP code.
+
+    Args:
+        zip_code: US ZIP code to search near
+        radius_miles: Search radius in miles (default 10)
+        limit: Maximum number of stores to return (default 5)
+    """
+    resp = requests.get(
+        f"{BASE_URL}/locations",
+        headers=_app_headers(),
+        params={
+            "filter.zipCode.near": zip_code,
+            "filter.radiusInMiles": radius_miles,
+            "filter.limit": limit,
+        },
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+
+    if not data:
+        return f"No Kroger stores found near {zip_code} within {radius_miles} miles."
+
+    results = []
+    for store in data:
+        name = store.get("name", "Unknown")
+        location_id = store.get("locationId", "N/A")
+        address = store.get("address", {})
+        addr_line = address.get("addressLine1", "")
+        city = address.get("city", "")
+        state = address.get("state", "")
+        zipcode = address.get("zipCode", "")
+        results.append(
+            f"- {name} (ID: {location_id})\n  {addr_line}, {city}, {state} {zipcode}"
+        )
+
+    return f"Found {len(data)} store(s) near {zip_code}:\n\n" + "\n".join(results)
+
+
+@mcp.tool()
+def search_products(query: str, location_id: str, limit: int = 10) -> str:
+    """Search for products at a specific Kroger store.
+
+    Args:
+        query: Search term (e.g. "organic milk")
+        location_id: Kroger store location ID (from find_stores)
+        limit: Maximum number of results (default 10)
+    """
+    resp = requests.get(
+        f"{BASE_URL}/products",
+        headers=_app_headers(),
+        params={
+            "filter.term": query,
+            "filter.locationId": location_id,
+            "filter.limit": limit,
+        },
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+
+    if not data:
+        return f"No products found for '{query}' at location {location_id}."
+
+    results = []
+    for product in data:
+        product_id = product.get("productId", "N/A")
+        description = product.get("description", "No description")
+        brand = product.get("brand", "Unknown brand")
+
+        # Extract price info if available
+        items = product.get("items", [{}])
+        price_info = ""
+        if items:
+            price = items[0].get("price", {})
+            regular = price.get("regular")
+            promo = price.get("promo")
+            if promo and promo > 0:
+                price_info = f" — ${promo:.2f} (sale, reg ${regular:.2f})"
+            elif regular and regular > 0:
+                price_info = f" — ${regular:.2f}"
+
+        # Extract size info
+        size = items[0].get("size", "") if items else ""
+        size_str = f" [{size}]" if size else ""
+
+        results.append(
+            f"- {description} ({brand}){size_str}{price_info}\n  Product ID: {product_id}"
+        )
+
+    return f"Found {len(data)} product(s) for '{query}':\n\n" + "\n".join(results)
+
+
+@mcp.tool()
+def get_product(product_id: str, location_id: str) -> str:
+    """Get detailed information about a specific product.
+
+    Args:
+        product_id: Kroger product ID
+        location_id: Kroger store location ID for pricing/availability
+    """
+    resp = requests.get(
+        f"{BASE_URL}/products/{product_id}",
+        headers=_app_headers(),
+        params={"filter.locationId": location_id},
+    )
+    resp.raise_for_status()
+    product = resp.json().get("data", {})
+
+    if not product:
+        return f"Product {product_id} not found."
+
+    description = product.get("description", "No description")
+    brand = product.get("brand", "Unknown brand")
+    categories = " > ".join(product.get("categories", []))
+
+    items = product.get("items", [{}])
+    item = items[0] if items else {}
+    size = item.get("size", "N/A")
+    price = item.get("price", {})
+    regular = price.get("regular")
+    promo = price.get("promo")
+
+    fulfillment = item.get("fulfillment", {})
+    in_store = fulfillment.get("inStore", False)
+    ship_to_home = fulfillment.get("shipToHome", False)
+    delivery = fulfillment.get("delivery", False)
+
+    lines = [
+        f"Product: {description}",
+        f"Brand: {brand}",
+        f"Size: {size}",
+        f"Category: {categories}" if categories else None,
+        f"Regular Price: ${regular:.2f}" if regular else None,
+        f"Sale Price: ${promo:.2f}" if promo and promo > 0 else None,
+        f"Available: In-store={'Yes' if in_store else 'No'}, "
+        f"Delivery={'Yes' if delivery else 'No'}, "
+        f"Ship-to-home={'Yes' if ship_to_home else 'No'}",
+        f"Product ID: {product.get('productId', product_id)}",
+    ]
+    return "\n".join(line for line in lines if line is not None)
+
+
+@mcp.tool()
+def add_to_cart(product_id: str, quantity: int = 1) -> str:
+    """Add a product to the user's Kroger cart. Requires user authorization.
+
+    If not yet authorized, returns instructions for how to authorize.
+
+    Args:
+        product_id: Kroger product ID to add
+        quantity: Number of items to add (default 1)
+    """
     try:
-        with stdio_server() as (input_stream, output_stream):
-            kroger_mcp_server.run(input_stream, output_stream)
-    except KeyboardInterrupt:
-        print("\nServer stopped by user (Ctrl+C).")
-    except ImportError as e:
-        print(f"ImportError during server run: {e}. This might indicate the 'mcp' library is not installed or not found.")
-        print("Please ensure 'mcp' is installed in your Python environment.")
-    except Exception as e:
-        # Log the full traceback for debugging if possible
-        import traceback
-        print(f"An unexpected error occurred while running the server: {e}")
-        traceback.print_exc()
-    finally:
-        print("Kroger MCP Server has shut down.")
+        headers = _user_headers()
+    except RuntimeError as e:
+        return str(e)
 
-if __name__ == '__main__':
-    run_server()
+    resp = requests.put(
+        f"{BASE_URL}/cart/add",
+        headers=headers,
+        json={
+            "items": [
+                {
+                    "upc": product_id,
+                    "quantity": quantity,
+                }
+            ]
+        },
+    )
+
+    if resp.status_code == 204 or resp.status_code == 200:
+        return f"Added {quantity}x product {product_id} to your Kroger cart."
+    else:
+        return f"Failed to add to cart (HTTP {resp.status_code}): {resp.text}"
+
+
+@mcp.tool()
+def submit_auth_code(code: str) -> str:
+    """Submit a Kroger OAuth authorization code to complete the login flow.
+
+    Use this when the user has visited the Kroger authorization URL and received
+    a code (from the browser redirect URL's ?code= parameter).
+
+    Args:
+        code: The authorization code from the Kroger OAuth redirect
+    """
+    try:
+        auth.exchange_code_for_token(code)
+        return "Authorization successful! You can now use add_to_cart."
+    except Exception as e:
+        return f"Authorization failed: {e}"
+
+
+if __name__ == "__main__":
+    mcp.run()
